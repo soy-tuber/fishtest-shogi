@@ -22,3 +22,9 @@ worker/fishtest.cfg
 worker/_testing_*/
 worker/testing/
 worker/*worker.lock
+
+# bookforge
+server/books/
+*.db-wal
+*.db-shm
+bookforge.cfg
