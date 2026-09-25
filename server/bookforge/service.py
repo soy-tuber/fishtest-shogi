@@ -430,9 +430,11 @@ class Bookforge:
             runs.sort(key=lambda r: self._run_order(r, kind))
             for run in runs:
                 task = self._make_task(run, worker, kind, req)
+                if task is None and not self.check_run_finished(run):
+                    # the check settles the book, which can add work
+                    task = self._make_task(run, worker, kind, req)
                 if task is not None:
                     return {"task": task}
-                self.check_run_finished(run)
             return {"task": None, "retry_after": RETRY_AFTER}
 
     def _make_task(self, run, worker, kind, req):
@@ -671,8 +673,13 @@ class Bookforge:
         ):
             reason = "max_core_hours"
         elif stop.get("until_frontier_empty"):
-            if self.book(args["book_id"]).queue_empty(run_id):
-                reason = "frontier_empty"
+            b = self.book(args["book_id"])
+            if b.queue_empty(run_id):
+                # Settle first: propagation may move a best move onto a
+                # position that does not exist yet, which is more work.
+                self._settle_book(args["book_id"])
+                if b.queue_empty(run_id):
+                    reason = "frontier_empty"
         if reason is None:
             return False
         self.finish_run(run_id, reason)
@@ -693,10 +700,72 @@ class Bookforge:
                 self._deactivate_task(task)
             return len(dead)
 
+    def _settle_book(self, book_id):
+        """Propagate a book's dirty nodes and expand the best moves that have
+        no child position yet. Returns the number of changed values."""
+        unexpanded = []
+        changed = propagate.propagate_dirty(self.book(book_id), unexpanded=unexpanded)
+        if unexpanded:
+            self.expand_best_moves(book_id, unexpanded)
+        return changed
+
+    def expand_best_moves(self, book_id, unexpanded):
+        """§5.1 follow-up: after propagation a node's best move can be one
+        that was never expanded (its expanded rival turned out worse), and
+        its value then rests on the parent's shallow MultiPV score. Create
+        that child for every expand run whose policy reaches it, so the move
+        gets searched. Returns the new node ids."""
+        b = self.book(book_id)
+        created = []
+        with self.lock:
+            by_kind = {}
+            for node_id, kind, move in unexpanded:
+                by_kind.setdefault(kind, []).append((node_id, move))
+            for kind, items in by_kind.items():
+                runs = self._growing_runs(book_id, kind)
+                if not runs:
+                    continue
+                new_ids = []
+                for node_id, move in items:
+                    node = b.node(node_id)
+                    ply = node["ply_min"] or 0
+                    run = next(
+                        (
+                            r
+                            for r in runs
+                            if ply + 1 <= r["args"]["policy"]["max_ply_from_root"]
+                            and b.is_done(
+                                node_id,
+                                kind,
+                                min_budget=r["args"]["policy"]["min_budget_for_expand"],
+                            )
+                        ),
+                        None,
+                    )
+                    if run is None:
+                        continue
+                    prio = policy.priority(
+                        ply + 1, 0, kind, policy.weights_for(run["args"])
+                    )
+                    try:
+                        child_id, new = policy.create_child(
+                            b, node_id, node["sfen"], move, ply + 1, prio
+                        )
+                    except shogi.PositionError:
+                        continue
+                    if new:
+                        new_ids.append(child_id)
+                        self.runs.update_one(
+                            {"_id": run["_id"]}, {"$inc": {"results.nodes_created": 1}}
+                        )
+                self._enqueue_new(book_id, kind, new_ids)
+                created += new_ids
+        return created
+
     def propagate_dirty(self):
         changed = 0
         for book_id in self.list_books():
-            changed += propagate.propagate_dirty(self.book(book_id))
+            changed += self._settle_book(book_id)
         return changed
 
     def check_runs(self):

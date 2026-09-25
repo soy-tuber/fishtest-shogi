@@ -203,6 +203,79 @@ class TestExpandRun(BookforgeTestCase):
             self.assertEqual(self.bf.get_run(run_id)["state"], "finished")
         self.assertEqual(book.select_todo("nnue", limit=1, ply_max=4), [])
 
+    def test_best_move_that_was_never_expanded_gets_expanded(self):
+        # Sente is "self": at the root only the best move (7g7f, +50) is
+        # expanded. Its child turns out bad (+400 for gote), so the root's
+        # best move becomes 2g2f (+30), which was never expanded. The server
+        # must create and search it before the run can finish.
+        self.bf.create_book("t3", {"self_side": "sente"})
+        self.bf.add_roots("t3", [shogi.STARTPOS])
+        args = expand_args(
+            book_id="t3",
+            search={"budget": 1000, "multipv": 2, "mode": "st"},
+            policy={
+                **expand_args()["policy"],
+                "self_side": "sente",
+                "opp_eval_diff": 0,
+                "max_ply_from_root": 1,
+            },
+        )
+        run_id = self.bf.create_run(args, approved=True)
+        w = self.worker()
+        book = self.bf.book("t3")
+
+        def search(scores):
+            task = self.post(
+                "/api/request_task",
+                {"worker_id": w.worker_id, "capability": "nnue", "slots": 1},
+            )["task"]
+            self.assertIsNotNone(task)
+            results = []
+            for pos in task["positions"]:
+                moves = scores[pos["sfen"]]
+                results.append(
+                    {
+                        "pos_id": pos["pos_id"],
+                        "engine_hash": H_BIN,
+                        "eval_hash": H_EVAL,
+                        "budget": 1000,
+                        "multipv": [{"move": m, "score_cp": v} for m, v in moves],
+                    }
+                )
+            res = self.post(
+                "/api/update_task",
+                {
+                    "worker_id": w.worker_id,
+                    "task_id": task["task_id"],
+                    "final": True,
+                    "results": results,
+                },
+            )
+            self.assertEqual(res["rejected"], [])
+            return [p["sfen"] for p in task["positions"]]
+
+        after_76 = shogi.apply_move(shogi.STARTPOS, "7g7f")
+        after_26 = shogi.apply_move(shogi.STARTPOS, "2g2f")
+        scores = {
+            shogi.STARTPOS: [("7g7f", 50), ("2g2f", 30)],
+            after_76: [("3c3d", 400), ("8c8d", 380)],
+            after_26: [("8c8d", -10), ("3c3d", -20)],
+        }
+        self.assertEqual(search(scores), [shogi.STARTPOS])
+        root = book.roots()[0]["node_id"]
+        self.assertEqual([r["move"] for r in book.children(root)], ["7g7f"])
+        self.assertEqual(search(scores), [after_76])
+        # the frontier looked empty, but settling found 2g2f
+        self.assertEqual(self.bf.get_run(run_id)["state"], "active")
+        self.assertEqual(
+            sorted(r["move"] for r in book.children(root)), ["2g2f", "7g7f"]
+        )
+        self.assertEqual(search(scores), [after_26])
+        self.assertEqual(self.bf.get_run(run_id)["state"], "finished")
+        self.bf.propagate_dirty()
+        # root = max(-400 via 7g7f, +10 via 2g2f)
+        self.assertEqual(book.node(root)["value_nnue"], 10)
+
     def test_pending_run_gets_no_work(self):
         run_id = self.bf.create_run(expand_args())
         w = self.worker()
