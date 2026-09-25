@@ -73,7 +73,33 @@ class TestSolve(unittest.TestCase):
         children = {1: [("b", 2)]}
         fixed = {2: -MATE_CP}  # side to move at 2 is mated
         vals = propagate.solve("nnue", [1, 2], own, children, fixed)
-        self.assertEqual(vals[1], MATE_CP)
+        self.assertEqual(vals[1], MATE_CP - 1)  # mate in 1
+
+    def test_mate_distance_grows_by_one_ply_per_level(self):
+        # R -a-> A -b-> T, T is mated. A mates in 1, so R is mated in 2.
+        own = {1: {"a": 0}, 2: {"b": 0}}
+        children = {1: [("a", 2)], 2: [("b", 3)]}
+        vals = propagate.solve("nnue", [1, 2, 3], own, children, {3: -MATE_CP})
+        self.assertEqual(vals[2], MATE_CP - 1)
+        self.assertEqual(vals[1], -(MATE_CP - 2))
+
+    def test_shorter_mate_is_preferred(self):
+        # a mates at once; b leads to a position that is mated in 3 plies.
+        own = {1: {"a": 0, "b": 0}}
+        children = {1: [("a", 2), ("b", 3)]}
+        vals = propagate.solve(
+            "nnue", [1], own, children, external={2: -MATE_CP, 3: -(MATE_CP - 3)}
+        )
+        self.assertEqual(vals[1], MATE_CP - 1)
+
+    def test_best_move_reported(self):
+        # a looked best (+50) but its child says -20; b (+30, not expanded)
+        # becomes the best move.
+        own = {1: {"a": 50, "b": 30}, 2: {"x": 20}}
+        children = {1: [("a", 2)]}
+        best = {}
+        propagate.solve("nnue", [1, 2], own, children, best=best)
+        self.assertEqual(best, {1: "b", 2: "x"})
 
     def test_repetition_cycle_is_draw(self):
         # A -m-> B -n-> A. Both sides' only alternatives are bad for them
@@ -97,6 +123,75 @@ class TestSolve(unittest.TestCase):
         vals = propagate.solve("dl", [1, 2], own, children)
         self.assertAlmostEqual(vals[2], 0.7)
         self.assertAlmostEqual(vals[1], 0.55)  # a is worth 1 - 0.7 = 0.3
+
+
+class TestPerpetualCheck(unittest.TestCase):
+    """連続王手の千日手: the side that checks on every move of the repetition
+    loses; ordinary repetitions stay draws."""
+
+    SENTE = {1: True, 2: False, 3: True, 4: False}
+
+    def test_checker_must_deviate(self):
+        # A (sente) -m, check-> B (gote) -n-> A. Staying is a loss for A, so A
+        # takes its -200 exit, and B is +200.
+        own = {1: {"m": 0, "x": -200}, 2: {"n": 0, "y": -150}}
+        children = {1: [("m", 2)], 2: [("n", 1)]}
+        best = {}
+        vals = propagate.solve(
+            "nnue",
+            [1, 2],
+            own,
+            children,
+            checks={(1, "m")},
+            sente=self.SENTE,
+            best=best,
+        )
+        self.assertEqual(vals, {1: -200, 2: 200})
+        # m ties with x (B just returns to A), but only x leaves the loop
+        self.assertEqual(best[1], "x")
+
+    def test_checker_without_exit_loses(self):
+        own = {1: {"m": 0}, 2: {"n": 0}}
+        children = {1: [("m", 2)], 2: [("n", 1)]}
+        vals = propagate.solve(
+            "nnue", [1, 2], own, children, checks={(1, "m")}, sente=self.SENTE
+        )
+        self.assertLess(vals[1], -(MATE_CP - 1000))
+        self.assertGreater(vals[2], MATE_CP - 1000)
+        dl = propagate.solve(
+            "dl",
+            [1, 2],
+            {1: {"m": 0.5}, 2: {"n": 0.5}},
+            children,
+            checks={(1, "m")},
+            sente=self.SENTE,
+        )
+        self.assertEqual(dl, {1: 0.0, 2: 1.0})
+
+    def test_defender_checking_back_does_not_matter(self):
+        # Only sente checks on every move; gote's reply may also check.
+        own = {1: {"m": 0}, 2: {"n": 0}}
+        children = {1: [("m", 2)], 2: [("n", 1)]}
+        vals = propagate.solve(
+            "nnue",
+            [1, 2],
+            own,
+            children,
+            checks={(1, "m"), (2, "n")},
+            sente=self.SENTE,
+        )
+        # both sides check every move: treated as an ordinary repetition
+        self.assertEqual(vals, {1: 0, 2: 0})
+
+    def test_loop_with_a_quiet_move_is_a_draw(self):
+        # A can repeat through B with a check or through D with a quiet move,
+        # so the repetition is not necessarily perpetual check.
+        own = {1: {"m": 0, "p": 0, "x": -200}, 2: {"n": 0}, 4: {"q": 0}}
+        children = {1: [("m", 2), ("p", 4)], 2: [("n", 1)], 4: [("q", 1)]}
+        vals = propagate.solve(
+            "nnue", [1, 2, 4], own, children, checks={(1, "m")}, sente=self.SENTE
+        )
+        self.assertEqual(vals[1], 0)
 
 
 class TestPropagateBook(unittest.TestCase):
@@ -187,6 +282,21 @@ class TestPropagateBook(unittest.TestCase):
         propagate.propagate_dirty(b)
         self.assertEqual(b.node(A)["value_nnue"], 0)
         self.assertEqual(b.node(B)["value_nnue"], 0)
+
+    def test_perpetual_check_in_book(self):
+        b = self.book
+        A = b.upsert_node("fake-A b -", 0)[0]  # sente to move
+        B = b.upsert_node("fake-B w -", 1)[0]  # gote to move
+        b.add_edge(A, "m", B, gives_check=True)
+        b.add_edge(B, "n", A)
+        self._eval(A, "nnue", [("m", 0), ("x", -190)])
+        self._eval(B, "nnue", [("n", 0), ("y", -150)])
+        unexpanded = []
+        propagate.propagate_dirty(b, unexpanded=unexpanded)
+        self.assertEqual(b.node(A)["value_nnue"], -190)
+        self.assertEqual(b.node(B)["value_nnue"], 190)
+        # A's best move is now x, which has no child position yet
+        self.assertIn((A, "nnue", "x"), unexpanded)
 
 
 if __name__ == "__main__":

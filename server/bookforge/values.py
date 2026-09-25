@@ -26,6 +26,22 @@ def negate(kind, value):
     return -value if kind == "nnue" else 1.0 - value
 
 
+# |cp| at or above this is a mate score ("mate in MATE_CP - |cp| plies").
+MATE_ZONE = MATE_CP - 1000
+
+
+def backed_up(kind, child_value):
+    """Value of a move for the parent, from the child's value: negated, and
+    for mate scores one ply further away (mate in n -> mated in n + 1)."""
+    v = negate(kind, child_value)
+    if kind == "nnue" and v is not None:
+        if v >= MATE_ZONE:
+            v -= 1
+        elif v <= -MATE_ZONE:
+            v += 1
+    return v
+
+
 def mate_to_cp(mate):
     """USI ``score mate n`` (n plies, sign = who mates) to centipawns."""
     if mate > 0:
