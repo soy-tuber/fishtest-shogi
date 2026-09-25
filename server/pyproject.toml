@@ -22,6 +22,7 @@ classifiers = [
 ]
 dependencies = [
     "awscli>=1.46.1",
+    "cshogi>=1.0.9",
     "email-validator>=2.3.0",
     "fastapi>=0.141.1",
     "itsdangerous>=2.2.0",
@@ -40,6 +41,7 @@ dependencies = [
 [dependency-groups]
 test = [
     "httpx2>=2.13.0",
+    "mongomock>=4.3.0",
 ]
 
 [project.urls]
@@ -53,7 +55,7 @@ requires = ["hatchling>=1.32.4"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["fishtest"]
+packages = ["fishtest", "bookforge"]
 
 [tool.ruff]
 target-version = "py314"
