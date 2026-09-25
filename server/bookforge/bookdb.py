@@ -13,11 +13,11 @@ import threading
 import time
 from contextlib import contextmanager
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # node.status
 PENDING = 0
-LEASED = 1  # reserved; leases are tracked per run in the server, not here
+LEASED = 1  # reserved; leases live in the queue table (queue.task_id)
 EVALUATED = 2
 PRUNED = 3
 TERMINAL = 4
@@ -71,9 +71,25 @@ CREATE TABLE IF NOT EXISTS edge (
   parent_id     INTEGER NOT NULL REFERENCES node(id),
   move          TEXT NOT NULL,
   child_id      INTEGER NOT NULL REFERENCES node(id),
+  gives_check   INTEGER NOT NULL DEFAULT 0,  -- the move checks (perpetual check)
   PRIMARY KEY (parent_id, move)
 );
 CREATE INDEX IF NOT EXISTS edge_child ON edge(child_id);
+
+-- Work queue per run and engine kind. Filled once when a run is approved and
+-- extended as positions are created; task_id is the lease (NULL = free).
+CREATE TABLE IF NOT EXISTS queue (
+  run_id        TEXT NOT NULL,
+  kind          TEXT NOT NULL,
+  node_id       INTEGER NOT NULL REFERENCES node(id),
+  priority      REAL NOT NULL,
+  task_id       TEXT,
+  PRIMARY KEY (run_id, kind, node_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS queue_free
+  ON queue(run_id, kind, priority DESC) WHERE task_id IS NULL;
+CREATE INDEX IF NOT EXISTS queue_task ON queue(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS queue_node ON queue(node_id);
 
 CREATE TABLE IF NOT EXISTS root (
   node_id       INTEGER PRIMARY KEY REFERENCES node(id),
@@ -105,8 +121,34 @@ class BookDb:
         with self.lock:
             # executescript() commits on its own; the statements are idempotent.
             self.conn.executescript(_SCHEMA)
-            if self.get_meta("schema_version") is None:
+            version = self.get_meta("schema_version")
+            if version is not None and version < 2:
+                self._migrate_v2()
+            if version != SCHEMA_VERSION:
                 self.set_meta("schema_version", SCHEMA_VERSION)
+
+    def _migrate_v2(self):
+        """v1 -> v2: edge.gives_check, backfilled from the positions."""
+        from bookforge import shogi
+
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(edge)")}
+        with self.transaction() as c:
+            if "gives_check" not in cols:
+                c.execute(
+                    "ALTER TABLE edge ADD COLUMN gives_check INTEGER NOT NULL DEFAULT 0"
+                )
+            rows = c.execute(
+                "SELECT e.parent_id, e.move, n.sfen FROM edge e "
+                "JOIN node n ON n.id = e.child_id"
+            ).fetchall()
+            c.executemany(
+                "UPDATE edge SET gives_check=1 WHERE parent_id=? AND move=?",
+                [
+                    (r["parent_id"], r["move"])
+                    for r in rows
+                    if shogi.in_check(r["sfen"])
+                ],
+            )
 
     def close(self):
         with self.lock:
@@ -177,6 +219,10 @@ class BookDb:
                         "priority=MAX(priority, ?), updated_at=? WHERE id=?",
                         (ply, ply, priority, now, row["id"]),
                     )
+                    c.execute(
+                        "UPDATE queue SET priority=? WHERE node_id=? AND priority<?",
+                        (priority, row["id"], priority),
+                    )
                 return row["id"], False
             values = values or {}
             cur = c.execute(
@@ -194,13 +240,14 @@ class BookDb:
             )
             return cur.lastrowid, True
 
-    def add_edge(self, parent_id, move, child_id):
+    def add_edge(self, parent_id, move, child_id, gives_check=False):
         """Returns True if the edge is new. A new edge makes the parent dirty,
         since the child may already carry a value."""
         with self.transaction() as c:
             cur = c.execute(
-                "INSERT OR IGNORE INTO edge(parent_id, move, child_id) VALUES(?, ?, ?)",
-                (parent_id, move, child_id),
+                "INSERT OR IGNORE INTO edge(parent_id, move, child_id, gives_check) "
+                "VALUES(?, ?, ?, ?)",
+                (parent_id, move, child_id, int(bool(gives_check))),
             )
             if cur.rowcount != 1:
                 return False
@@ -315,31 +362,20 @@ class BookDb:
 
     # work selection
 
-    def select_todo(
-        self,
-        kind,
-        *,
-        limit,
-        exclude=(),
-        ply_min=None,
-        ply_max=None,
-        eval_hash=None,
-        min_budget=0,
-    ):
-        """Nodes that still need an evaluation of ``kind`` matching
-        (``eval_hash``, budget >= ``min_budget``), best priority first."""
-        sql = [
-            "SELECT id, sfen FROM node n WHERE n.status IN (?, ?, ?)",
-        ]
+    @staticmethod
+    def _todo_where(kind, ply_min, ply_max, eval_hash, min_budget):
+        """WHERE clause (on ``node n``) for nodes that still need an
+        evaluation of ``kind`` matching (``eval_hash``, budget >= ``min_budget``)."""
+        sql = ["n.status IN (?, ?, ?)"]
         params = [PENDING, LEASED, EVALUATED]
         if ply_min is not None:
-            sql.append("AND n.ply_min >= ?")
+            sql.append("n.ply_min >= ?")
             params.append(ply_min)
         if ply_max is not None:
-            sql.append("AND n.ply_min <= ?")
+            sql.append("n.ply_min <= ?")
             params.append(ply_max)
         sub = (
-            "AND NOT EXISTS (SELECT 1 FROM eval e WHERE e.node_id = n.id "
+            "NOT EXISTS (SELECT 1 FROM eval e WHERE e.node_id = n.id "
             "AND e.engine_kind = ? AND e.budget >= ?"
         )
         params += [kind, min_budget]
@@ -347,11 +383,130 @@ class BookDb:
             sub += " AND e.eval_hash = ?"
             params.append(eval_hash)
         sql.append(sub + ")")
-        sql.append("ORDER BY n.priority DESC, n.ply_min, n.id LIMIT ?")
-        exclude = set(exclude)
-        params.append(limit + len(exclude))
-        rows = self.query(" ".join(sql), params)
-        return [r for r in rows if r["id"] not in exclude][:limit]
+        return " AND ".join(sql), params
+
+    def select_todo(
+        self, kind, *, limit, ply_min=None, ply_max=None, eval_hash=None, min_budget=0
+    ):
+        """Nodes that still need an evaluation, best priority first. This scans
+        the book; the server uses it only to fill a run's queue."""
+        where, params = self._todo_where(kind, ply_min, ply_max, eval_hash, min_budget)
+        return self.query(
+            f"SELECT id, sfen FROM node n WHERE {where} "
+            "ORDER BY n.priority DESC, n.ply_min, n.id LIMIT ?",
+            (*params, limit),
+        )
+
+    def is_done(self, node_id, kind, *, eval_hash=None, min_budget=0):
+        return (
+            self.best_eval(node_id, kind, eval_hash=eval_hash, min_budget=min_budget)
+            is not None
+        )
+
+    # run queues
+
+    def fill_queue(
+        self, run_id, kind, *, ply_min=None, ply_max=None, eval_hash=None, min_budget=0
+    ):
+        """Queue every node that needs work for a run (one scan, at approval)."""
+        where, params = self._todo_where(kind, ply_min, ply_max, eval_hash, min_budget)
+        with self.transaction() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO queue(run_id, kind, node_id, priority) "
+                f"SELECT ?, ?, n.id, n.priority FROM node n WHERE {where}",
+                (run_id, kind, *params),
+            )
+            return cur.rowcount
+
+    def enqueue(self, run_id, kind, node_ids, *, ply_max=None):
+        """Queue new nodes (non-terminal, within ``ply_max``) for a run."""
+        node_ids = list(node_ids)
+        if not node_ids:
+            return 0
+        n = 0
+        with self.transaction() as c:
+            for i in range(0, len(node_ids), 500):
+                chunk = node_ids[i : i + 500]
+                marks = ",".join("?" * len(chunk))
+                sql = (
+                    "INSERT OR IGNORE INTO queue(run_id, kind, node_id, priority) "
+                    f"SELECT ?, ?, id, priority FROM node WHERE id IN ({marks}) "
+                    "AND status != ?"
+                )
+                params = [run_id, kind, *chunk, TERMINAL]
+                if ply_max is not None:
+                    sql += " AND ply_min <= ?"
+                    params.append(ply_max)
+                n += c.execute(sql, params).rowcount
+        return n
+
+    def lease(self, run_id, kind, task_id, limit, *, eval_hash=None, min_budget=0):
+        """Lease up to ``limit`` free queued nodes, best priority first. Nodes
+        that meanwhile got a matching evaluation (e.g. from another run) are
+        dropped from the queue instead. Returns rows (id, sfen)."""
+        out = []
+        with self.transaction() as c:
+            while len(out) < limit:
+                rows = c.execute(
+                    "SELECT q.node_id, n.sfen FROM queue q JOIN node n "
+                    "ON n.id = q.node_id WHERE q.run_id=? AND q.kind=? "
+                    "AND q.task_id IS NULL ORDER BY q.priority DESC LIMIT ?",
+                    (run_id, kind, limit - len(out)),
+                ).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    if self.is_done(
+                        r["node_id"], kind, eval_hash=eval_hash, min_budget=min_budget
+                    ):
+                        c.execute(
+                            "DELETE FROM queue WHERE run_id=? AND kind=? AND node_id=?",
+                            (run_id, kind, r["node_id"]),
+                        )
+                    else:
+                        c.execute(
+                            "UPDATE queue SET task_id=? WHERE run_id=? AND kind=? "
+                            "AND node_id=?",
+                            (task_id, run_id, kind, r["node_id"]),
+                        )
+                        out.append({"id": r["node_id"], "sfen": r["sfen"]})
+        return out
+
+    def release(self, task_id):
+        """Return the still-queued nodes of a task to the free pool."""
+        with self.transaction() as c:
+            return c.execute(
+                "UPDATE queue SET task_id=NULL WHERE task_id=?", (task_id,)
+            ).rowcount
+
+    def complete(self, run_id, kind, node_ids):
+        with self.transaction() as c:
+            c.executemany(
+                "DELETE FROM queue WHERE run_id=? AND kind=? AND node_id=?",
+                [(run_id, kind, nid) for nid in node_ids],
+            )
+
+    def queue_counts(self, run_id):
+        """{kind: {"free": n, "leased": m}}"""
+        out = {}
+        for r in self.query(
+            "SELECT kind, task_id IS NULL AS free, COUNT(*) AS c FROM queue "
+            "WHERE run_id=? GROUP BY kind, free",
+            (run_id,),
+        ):
+            d = out.setdefault(r["kind"], {"free": 0, "leased": 0})
+            d["free" if r["free"] else "leased"] = r["c"]
+        return out
+
+    def queue_empty(self, run_id):
+        return (
+            self.query_one("SELECT 1 FROM queue WHERE run_id=? LIMIT 1", (run_id,))
+            is None
+        )
+
+    def clear_queue(self, run_id):
+        with self.transaction() as c:
+            c.execute("DELETE FROM queue WHERE run_id=?", (run_id,))
 
     # statistics
 

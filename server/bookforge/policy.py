@@ -79,7 +79,7 @@ def create_child(book, parent_id, parent_sfen, move, ply, prio):
         child_id, created = book.upsert_node(
             child_sfen, ply, prio, status=bookdb.TERMINAL, values=values
         )
-    book.add_edge(parent_id, move, child_id)
+    book.add_edge(parent_id, move, child_id, gives_check=shogi.in_check(child_sfen))
     return child_id, created
 
 

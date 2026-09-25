@@ -4,9 +4,11 @@ MongoDB holds runs, tasks and workers (collections ``book_runs``,
 ``book_tasks``, ``book_workers``, ``book_worker_logs``); the position DAG of
 each book lives in its own SQLite file (``bookdb.BookDb``).
 
-A Task is a lease on a bundle of positions for one engine kind. Leases are
-tracked in memory per (run, kind) and rebuilt from the active tasks on
-startup. All state changes of runs and tasks happen under ``self.lock``.
+A Task is a lease on a bundle of positions for one engine kind. The work of
+each run lives in the book's ``queue`` table: filled once when the run is
+approved, extended as positions are created, and a queued row carries the
+id of the task that leases it. All state changes of runs and tasks happen
+under ``self.lock``.
 """
 
 import os
@@ -96,9 +98,7 @@ class Bookforge:
         self.lock = threading.RLock()
         self._books = {}
         self._books_lock = threading.Lock()
-        self.leases = {}  # (run_id, kind) -> set(node_id)
         self.scheduler = None
-        self._rebuild_leases()
 
     # books
 
@@ -224,6 +224,9 @@ class Bookforge:
             run = self.get_run(run_id)
             if run["args"]["type"] == "expand":
                 self.seed_expand(run)
+            b = self.book(run["args"]["book_id"])
+            for kind in run_engines(run["args"]):
+                b.fill_queue(run_id, kind, **self._todo_filter(run["args"], kind))
             return run
 
     def pause_run(self, run_id, paused=True):
@@ -243,14 +246,50 @@ class Bookforge:
             self._set_run(run_id, {"state": "finished", "finish_reason": reason})
             for task in self.tasks.find({"run_id": run_id, "active": True}):
                 self._deactivate_task(task)
+            run = self.get_run(run_id)
+            self.book(run["args"]["book_id"]).clear_queue(run_id)
 
     def active_runs(self):
         return list(self.runs.find({"state": "active"}))
 
     # expansion bookkeeping
 
+    def _growing_runs(self, book_id, kind):
+        """Expand runs (active or paused) of a book whose engine is ``kind``:
+        they must see every position created in the book."""
+        return [
+            r
+            for r in self.runs.find(
+                {
+                    "args.book_id": book_id,
+                    "args.type": "expand",
+                    "state": {"$in": ["active", "paused"]},
+                }
+            )
+            if r["args"]["engine"]["kind"] == kind
+        ]
+
+    def _enqueue_new(self, book_id, kind, node_ids):
+        if not node_ids:
+            return
+        b = self.book(book_id)
+        for run in self._growing_runs(book_id, kind):
+            b.enqueue(
+                str(run["_id"]),
+                kind,
+                node_ids,
+                ply_max=run["args"]["policy"]["max_ply_from_root"],
+            )
+
+    @staticmethod
+    def _done_filter(todo_filter):
+        return {
+            "eval_hash": todo_filter.get("eval_hash"),
+            "min_budget": todo_filter["min_budget"],
+        }
+
     def _todo_filter(self, args, kind):
-        """Keyword arguments for BookDb.select_todo for a run and kind."""
+        """What still needs work for a run and kind (BookDb.fill_queue arguments)."""
         search = run_search(args, kind)
         if args["type"] == "expand":
             return {
@@ -275,22 +314,23 @@ class Bookforge:
         min_budget = args["policy"]["min_budget_for_expand"]
         queue = deque(r["node_id"] for r in b.roots())
         seen = set(queue)
-        created = 0
+        created = []
         while queue:
             nid = queue.popleft()
             node = b.node(nid)
             ev = b.best_eval(nid, kind, min_budget=min_budget)
             if ev is not None:
-                created += len(policy.expand(b, node, kind, b.cands(ev["id"]), args))
+                created += policy.expand(b, node, kind, b.cands(ev["id"]), args)
             for child in b.children(nid):
                 if child["child_id"] not in seen:
                     seen.add(child["child_id"])
                     queue.append(child["child_id"])
         if created:
             self.runs.update_one(
-                {"_id": run["_id"]}, {"$inc": {"results.nodes_created": created}}
+                {"_id": run["_id"]}, {"$inc": {"results.nodes_created": len(created)}}
             )
-        return created
+            self._enqueue_new(args["book_id"], kind, created)
+        return len(created)
 
     # workers
 
@@ -334,15 +374,6 @@ class Bookforge:
 
     # tasks
 
-    def _rebuild_leases(self):
-        self.leases = {}
-        for task in self.tasks.find({"active": True}):
-            done = set(task.get("done", []))
-            key = (task["run_id"], task["engine_kind"])
-            self.leases.setdefault(key, set()).update(
-                p["pos_id"] for p in task["positions"] if p["pos_id"] not in done
-            )
-
     def _task_size(self, worker, kind, search, slots):
         bench = worker.get("bench", {})
         budget = search["budget"]
@@ -362,8 +393,16 @@ class Bookforge:
             n = max(slots, int(TASK_TARGET_SECONDS * pps / budget))
         return min(n, TASK_MAX_POSITIONS)
 
+    def _active_slots(self, run_id, kind):
+        return sum(
+            t["slots"]
+            for t in self.tasks.find(
+                {"run_id": run_id, "engine_kind": kind, "active": True}, {"slots": 1}
+            )
+        )
+
     def _run_order(self, run, kind):
-        active = len(self.leases.get((str(run["_id"]), kind), ()))
+        active = self._active_slots(str(run["_id"]), kind)
         return (
             -run["args"]["priority"],
             active / run["args"]["throughput"],
@@ -411,16 +450,23 @@ class Bookforge:
             engine_hash = binary["sha256"]
         n = self._task_size(worker, kind, search, req["slots"])
         b = self.book(args["book_id"])
-        leased = self.leases.setdefault((run_id, kind), set())
-        rows = b.select_todo(
-            kind, limit=n, exclude=leased, **self._todo_filter(args, kind)
+        oid = ObjectId()
+        task_id = str(oid)
+        rows = b.lease(
+            run_id,
+            kind,
+            task_id,
+            n,
+            **self._done_filter(self._todo_filter(args, kind)),
         )
         if not rows:
             return None
         positions = [{"pos_id": r["id"], "sfen": r["sfen"]} for r in rows]
         now = time.time()
         doc = {
+            "_id": oid,
             "run_id": run_id,
+            "book_id": args["book_id"],
             "worker_id": worker["_id"],
             "engine_kind": kind,
             "engine_hash": engine_hash,
@@ -433,8 +479,7 @@ class Bookforge:
             "last_updated": now,
             "slots": req["slots"],
         }
-        task_id = str(self.tasks.insert_one(doc).inserted_id)
-        leased.update(p["pos_id"] for p in positions)
+        self.tasks.insert_one(doc)
         engine_out = {
             "kind": kind,
             "binary": binary,
@@ -460,13 +505,7 @@ class Bookforge:
         return task
 
     def _deactivate_task(self, task):
-        done = set(task.get("done", []))
-        key = (task["run_id"], task["engine_kind"])
-        leased = self.leases.get(key)
-        if leased is not None:
-            leased.difference_update(
-                p["pos_id"] for p in task["positions"] if p["pos_id"] not in done
-            )
+        self.book(task["book_id"]).release(str(task["_id"]))
         self.tasks.update_one(
             {"_id": task["_id"]},
             {"$set": {"active": False, "last_updated": time.time()}},
@@ -517,7 +556,7 @@ class Bookforge:
         done = set(task.get("done", []))
         accepted, rejected = [], []
         engine_seconds = 0.0
-        created = 0
+        created = []
         threads = int(run_engines(args)[kind].get("usi_options", {}).get("Threads", 1))
         with b.transaction():
             for res in results:
@@ -555,8 +594,8 @@ class Bookforge:
                     cands=res["multipv"],
                 )
                 if args["type"] == "expand":
-                    created += len(
-                        policy.expand(b, b.node(pos_id), kind, res["multipv"], args)
+                    created += policy.expand(
+                        b, b.node(pos_id), kind, res["multipv"], args
                     )
                 done.add(pos_id)
                 accepted.append(pos_id)
@@ -569,9 +608,8 @@ class Bookforge:
                     "$set": {"last_updated": time.time()},
                 },
             )
-            leased = self.leases.get((str(run["_id"]), kind))
-            if leased is not None:
-                leased.difference_update(accepted)
+            b.complete(str(run["_id"]), kind, accepted)
+        self._enqueue_new(args["book_id"], kind, created)
         self.runs.update_one(
             {"_id": run["_id"]},
             {
@@ -579,7 +617,7 @@ class Bookforge:
                     "results.positions": len(accepted),
                     "results.rejected": len(rejected),
                     "results.engine_seconds": engine_seconds,
-                    "results.nodes_created": created,
+                    "results.nodes_created": len(created),
                     f"results.by_kind.{kind}": len(accepted),
                 },
                 "$set": {"last_updated": time.time()},
@@ -633,16 +671,7 @@ class Bookforge:
         ):
             reason = "max_core_hours"
         elif stop.get("until_frontier_empty"):
-            b = self.book(args["book_id"])
-            empty = True
-            for kind in run_engines(args):
-                if self.leases.get((run_id, kind)):
-                    empty = False
-                    break
-                if b.select_todo(kind, limit=1, **self._todo_filter(args, kind)):
-                    empty = False
-                    break
-            if empty:
+            if self.book(args["book_id"]).queue_empty(run_id):
                 reason = "frontier_empty"
         if reason is None:
             return False
@@ -710,15 +739,12 @@ class Bookforge:
             }
             for r in b.roots()
         ]
-        leased = {
-            k: len(self.leases.get((run_id, k), ())) for k in run_engines(run["args"])
-        }
         return {
             "run_id": run_id,
             "state": run["state"],
             "finish_reason": run["finish_reason"],
             "results": run["results"],
-            "leased": leased,
+            "queue": b.queue_counts(run_id),
             "book": b.counts(),
             "roots": roots,
         }

@@ -91,6 +91,11 @@ def check_pv(sfen, pv_moves):
     return True
 
 
+def in_check(sfen):
+    """True if the side to move is in check (i.e. the last move gave check)."""
+    return bool(_board(sfen).is_check())
+
+
 def terminal_state(sfen):
     """None for an ordinary position, else 'mated' (side to move has no legal
     move) or 'nyugyoku' (side to move can declare a win)."""

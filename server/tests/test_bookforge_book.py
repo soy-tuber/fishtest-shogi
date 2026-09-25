@@ -140,7 +140,7 @@ class TestPolicy(unittest.TestCase):
         )
         self.assertEqual([r["move"] for r in self.book.children(root)], ["7g7f"])
 
-    def test_select_todo_and_leases(self):
+    def test_select_todo(self):
         b = self.book
         root_prio = policy.priority(0, 0, "nnue", policy.DEFAULT_WEIGHTS)
         root, _ = b.upsert_node(shogi.STARTPOS, 0, root_prio)
@@ -148,8 +148,63 @@ class TestPolicy(unittest.TestCase):
         todo = b.select_todo("nnue", limit=10)
         self.assertEqual(len(todo), 4)
         self.assertEqual(todo[0]["id"], root)  # root has the highest priority
-        self.assertEqual(len(b.select_todo("nnue", limit=10, exclude={root})), 3)
         self.assertEqual(len(b.select_todo("nnue", limit=10, ply_max=0)), 1)
+
+    def test_queue_lease_release_complete(self):
+        b = self.book
+        root_prio = policy.priority(0, 0, "nnue", policy.DEFAULT_WEIGHTS)
+        root, _ = b.upsert_node(shogi.STARTPOS, 0, root_prio)
+        policy.expand(b, b.node(root), "nnue", self.CANDS, self.args("gote"))
+        self.assertEqual(b.fill_queue("r1", "nnue"), 4)
+        self.assertEqual(b.fill_queue("r1", "nnue"), 0)  # idempotent
+
+        first = b.lease("r1", "nnue", "t1", 2)
+        self.assertEqual([r["id"] for r in first][0], root)  # priority order
+        self.assertEqual(b.queue_counts("r1"), {"nnue": {"free": 2, "leased": 2}})
+        second = b.lease("r1", "nnue", "t2", 10)
+        self.assertEqual(len(second), 2)
+        self.assertFalse({r["id"] for r in first} & {r["id"] for r in second})
+        self.assertEqual(b.lease("r1", "nnue", "t3", 10), [])
+
+        self.assertEqual(b.release("t2"), 2)
+        b.complete("r1", "nnue", [r["id"] for r in first])
+        self.assertEqual(b.queue_counts("r1"), {"nnue": {"free": 2, "leased": 0}})
+
+        # a node that got a matching evaluation elsewhere is dropped, not leased
+        other = second[0]["id"]
+        b.insert_eval(
+            other,
+            kind="nnue",
+            engine_hash="e",
+            eval_hash="h",
+            budget=10,
+            depth=1,
+            seldepth=1,
+            elapsed_ms=1,
+            worker_id="w",
+            run_id="r0",
+            task_id="t0",
+            cands=[{"move": "7g7f", "score_cp": 0}],
+        )
+        rest = b.lease("r1", "nnue", "t4", 10)
+        self.assertEqual([r["id"] for r in rest], [second[1]["id"]])
+        b.complete("r1", "nnue", [second[1]["id"]])
+        self.assertTrue(b.queue_empty("r1"))
+
+        # other runs' queues are separate
+        b.fill_queue("r2", "nnue", ply_max=0, eval_hash="new", min_budget=1)
+        self.assertEqual(b.queue_counts("r2"), {"nnue": {"free": 1, "leased": 0}})
+        b.clear_queue("r2")
+        self.assertTrue(b.queue_empty("r2"))
+
+    def test_edges_record_checks(self):
+        b = self.book
+        sfen = "4k4/9/9/9/9/9/9/9/4K3R b -"  # sente rook on 1i, gote king on 5a
+        node, _ = b.upsert_node(sfen, 0)
+        policy.create_child(b, node, sfen, "1i1a", 1, 0.0)  # rook to 1a: check
+        policy.create_child(b, node, sfen, "1i1e", 1, 0.0)  # rook to 1e: quiet
+        rows = {r["move"]: r["gives_check"] for r in b.query("SELECT * FROM edge")}
+        self.assertEqual(rows, {"1i1a": 1, "1i1e": 0})
 
 
 class TestValidate(unittest.TestCase):
@@ -212,6 +267,49 @@ class TestValidate(unittest.TestCase):
         for reason, res in cases.items():
             self.assertEqual(self.check(res), reason, reason)
         self.assertEqual(self.check(self.result(), kind="dl"), "cp_from_dl")
+
+
+class TestMigration(unittest.TestCase):
+    def test_v1_book_gains_checks_and_queue(self):
+        import json
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "old.db")
+            c = sqlite3.connect(path)
+            c.executescript(
+                """
+                CREATE TABLE node (id INTEGER PRIMARY KEY, sfen TEXT NOT NULL UNIQUE,
+                  ply_min INTEGER, status INTEGER NOT NULL, priority REAL NOT NULL
+                  DEFAULT 0, value_nnue INTEGER, value_dl REAL, dirty INTEGER NOT NULL
+                  DEFAULT 0, updated_at INTEGER);
+                CREATE TABLE edge (parent_id INTEGER NOT NULL, move TEXT NOT NULL,
+                  child_id INTEGER NOT NULL, PRIMARY KEY (parent_id, move));
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+                """
+            )
+            parent = "4k4/9/9/9/9/9/9/9/4K3R b -"
+            c.executemany(
+                "INSERT INTO node(id, sfen, ply_min, status) VALUES(?, ?, ?, 2)",
+                [
+                    (1, parent, 0),
+                    (2, shogi.apply_move(parent, "1i1a"), 1),
+                    (3, shogi.apply_move(parent, "1i1e"), 1),
+                ],
+            )
+            c.executemany(
+                "INSERT INTO edge VALUES(1, ?, ?)", [("1i1a", 2), ("1i1e", 3)]
+            )
+            c.execute("INSERT INTO meta VALUES('schema_version', ?)", (json.dumps(1),))
+            c.commit()
+            c.close()
+
+            b = bookdb.BookDb(path)
+            self.assertEqual(b.get_meta("schema_version"), bookdb.SCHEMA_VERSION)
+            rows = {r["move"]: r["gives_check"] for r in b.query("SELECT * FROM edge")}
+            self.assertEqual(rows, {"1i1a": 1, "1i1e": 0})
+            self.assertTrue(b.queue_empty("any"))
+            b.close()
 
 
 if __name__ == "__main__":

@@ -110,7 +110,7 @@ class TestExpandRun(BookforgeTestCase):
         self.assertEqual(run["state"], "finished")
         self.assertEqual(run["finish_reason"], "frontier_empty")
         self.assertEqual(run["results"]["rejected"], 0)
-        self.assertFalse(self.bf.leases.get((run_id, "nnue")))
+        self.assertTrue(self.bf.book("t1").queue_empty(run_id))
 
         book = self.bf.book("t1")
         # Every non-terminal node within the ply limit has an NNUE eval.
@@ -190,6 +190,18 @@ class TestExpandRun(BookforgeTestCase):
             )["c"],
             1,
         )
+
+    def test_parallel_expand_runs_share_new_positions(self):
+        # Two expand runs on one book: positions created by either run's
+        # results enter both queues, so neither finishes with holes.
+        deep = expand_args(policy={**expand_args()["policy"], "max_ply_from_root": 4})
+        a = self.bf.create_run(expand_args(), approved=True)
+        b_id = self.bf.create_run(deep, approved=True)
+        self.drain(self.worker())
+        book = self.bf.book("t1")
+        for run_id in (a, b_id):
+            self.assertEqual(self.bf.get_run(run_id)["state"], "finished")
+        self.assertEqual(book.select_todo("nnue", limit=1, ply_max=4), [])
 
     def test_pending_run_gets_no_work(self):
         run_id = self.bf.create_run(expand_args())
@@ -309,7 +321,8 @@ class TestWorkerApi(BookforgeTestCase):
 
     def test_failed_task_releases_positions(self):
         task = self.request()
-        self.assertEqual(len(self.bf.leases[(self.run_id, "nnue")]), 1)
+        book = self.bf.book("t1")
+        self.assertEqual(book.queue_counts(self.run_id)["nnue"]["leased"], 1)
         self.post(
             "/api/failed_task",
             {
@@ -318,7 +331,7 @@ class TestWorkerApi(BookforgeTestCase):
                 "message": "crash",
             },
         )
-        self.assertEqual(len(self.bf.leases[(self.run_id, "nnue")]), 0)
+        self.assertEqual(book.queue_counts(self.run_id)["nnue"]["leased"], 0)
         self.assertEqual(self.bf.get_run(self.run_id)["failures"], 1)
         self.assertEqual(
             self.post(
@@ -342,12 +355,20 @@ class TestWorkerApi(BookforgeTestCase):
         self.assertEqual(beat, {"continue": False})
 
     def test_leases_survive_restart(self):
-        self.request()
+        task = self.request()
+        self.bf.shutdown()
         from bookforge.service import Bookforge
 
         again = Bookforge(self.db, self.tmp.name)
-        self.assertEqual(again.leases, self.bf.leases)
-        again.shutdown()
+        self.addCleanup(again.shutdown)
+        counts = again.book("t1").queue_counts(self.run_id)
+        self.assertEqual(counts["nnue"]["leased"], len(task["positions"]))
+        # the leased root is not handed out twice
+        other = DummyWorker(self.post, seed=777)
+        other.register()
+        self.bf = again
+        self.client.app.state.bookforge = again
+        self.assertIsNone(other.run_one_task())
 
     def test_worker_log(self):
         self.post("/api/worker_log", {"worker_id": self.w.worker_id, "message": "hi"})
