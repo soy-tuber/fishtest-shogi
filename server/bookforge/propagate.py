@@ -20,7 +20,9 @@ MAX_SCC_ITERATIONS = 64
 
 
 def _sccs(members, children):
-    """Tarjan's algorithm, iterative. Yields SCCs (lists) sinks first."""
+    """Tarjan's algorithm, iterative. Returns SCCs (lists) sinks first.
+    ``members`` gives the visiting order; membership tests use a set."""
+    member_set = set(members)
     index = {}
     low = {}
     on_stack = set()
@@ -39,7 +41,7 @@ def _sccs(members, children):
             v, it = work[-1]
             advanced = False
             for _move, w in it:
-                if w not in members:
+                if w not in member_set:
                     continue
                 if w not in index:
                     index[w] = low[w] = counter
