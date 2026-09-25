@@ -1,6 +1,9 @@
 """Phase 1 acceptance (design doc §12): a dummy worker drives runs through the
-HTTP API until they finish. MongoDB is replaced by mongomock so the test runs
-anywhere; the SQLite books are real files."""
+HTTP API until they finish. The SQLite books are real files.
+
+MongoDB: mongomock by default, so the tests run anywhere. With
+BOOKFORGE_TEST_MONGODB=1 (set in CI, which starts mongod) they use the real
+server on localhost, database ``bookforge_tests``, dropped around each test."""
 
 import os
 import tempfile
@@ -64,13 +67,25 @@ def expand_args(**over):
     return args
 
 
+def test_database(case):
+    if os.environ.get("BOOKFORGE_TEST_MONGODB"):
+        from pymongo import MongoClient
+
+        client = MongoClient("localhost", serverSelectionTimeoutMS=5000)
+        client.drop_database("bookforge_tests")
+        case.addCleanup(client.close)
+        case.addCleanup(client.drop_database, "bookforge_tests")
+        return client["bookforge_tests"]
+    return mongomock.MongoClient()["bookforge_tests"]
+
+
 class BookforgeTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         env = mock.patch.dict(os.environ, {"BOOKFORGE_AUTH": "stub"})
         env.start()
         self.addCleanup(env.stop)
-        self.db = mongomock.MongoClient()["bookforge_tests"]
+        self.db = test_database(self)
         app = create_app(db=self.db, books_dir=self.tmp.name, schedule=False)
         self.client = TestClient(app)
         self.client.__enter__()

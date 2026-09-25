@@ -41,3 +41,5 @@ jobs:
         run: uv run python -m unittest discover -vb -s tests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # bookforge tests use the real mongod instead of mongomock
+          BOOKFORGE_TEST_MONGODB: "1"
